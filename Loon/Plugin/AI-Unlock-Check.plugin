@@ -16,6 +16,8 @@ claude = switch,true,tag=检测 Claude
 gemini = switch,true,tag=检测 Gemini,desc=单节点约 800KB 流量，蜂窝网络下建议改用 lite
 depth = select,"full","lite",tag=检测深度,desc=full=请求各服务真实端点（准确、流量大）；lite=只按出口地区判断（几乎不耗流量）
 strict = switch,false,tag=严格模式,desc=开启后 Cloudflare 人机验证、OpenAI App 机房 IP 拦截也算未解锁
+routeCheck = switch,true,tag=路由自检,desc=抽样比对各节点的出口 IP。若全部相同说明请求没有真的分别走各节点，此时不写缓存也不自动切换。除非你的机场确实全部单出口，否则不要关
+extraBlockCC = input,"",tag=追加地区黑名单,desc=逗号分隔的两位国家码，如 TW,VN。对三家服务同时生效
 gptGroup = input,"",tag=自动切换 · ChatGPT 策略组,desc=留空则不自动切换。填策略组名，会切到延迟最低的可解锁节点
 cldGroup = input,"",tag=自动切换 · Claude 策略组,desc=留空则不自动切换
 gmnGroup = input,"",tag=自动切换 · Gemini 策略组,desc=留空则不自动切换
@@ -27,6 +29,6 @@ cacheTTL = input,"12",tag=缓存有效期,desc=小时
 notify = switch,true,tag=完成后通知
 
 [Script]
-cron {cron} script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,enable=true,argument=[{group},{chatgpt},{claude},{gemini},{depth},{strict},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]
+cron {cron} script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,enable=true,argument=[{group},{chatgpt},{claude},{gemini},{depth},{strict},{routeCheck},{extraBlockCC},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]
 
-generic script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,img-url=sparkles.system,argument=[{group},{chatgpt},{claude},{gemini},{depth},{strict},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]
+generic script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,img-url=sparkles.system,argument=[{group},{chatgpt},{claude},{gemini},{depth},{strict},{routeCheck},{extraBlockCC},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]

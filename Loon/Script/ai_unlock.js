@@ -67,6 +67,10 @@ var CFG = {
   depth: str(ARG.depth, "full").toLowerCase(),
   // 严格模式：Cloudflare 人机验证 / OpenAI App 机房 IP 拦截也算未解锁
   strict: bool(ARG.strict, false),
+  // 路由自检：抽样比对出口 IP，确认请求真的分别从各节点发出
+  routeCheck: bool(ARG.routeCheck, true),
+  // 追加的地区黑名单，逗号分隔的两位国家码，对三家服务同时生效
+  extraBlockCC: str(ARG.extraBlockCC, ""),
 
   // 标记
   marker: str(ARG.marker, "⚡"),
@@ -221,6 +225,25 @@ var BLOCKED = {
   gemini: ["CN", "HK", "MO", "RU", "IR", "KP", "SY", "CU", "BY"]
 };
 
+// 合并用户自定义的追加黑名单
+(function mergeExtraBlock() {
+  if (!CFG.extraBlockCC) return;
+  var extra = CFG.extraBlockCC.split(/[,\s]+/)
+    .map(function (c) {
+      return c.trim().toUpperCase();
+    })
+    .filter(function (c) {
+      return /^[A-Z]{2}$/.test(c);
+    });
+  if (!extra.length) return;
+  ["chatgpt", "claude", "gemini"].forEach(function (k) {
+    extra.forEach(function (c) {
+      if (BLOCKED[k].indexOf(c) === -1) BLOCKED[k].push(c);
+    });
+  });
+  log("追加地区黑名单: " + extra.join(","));
+})();
+
 function ok(cc, note) {
   return { ok: true, cc: cc || "", note: note || "" };
 }
@@ -313,27 +336,103 @@ async function checkGemini(nodeRef, cc) {
   return no("特征未命中", region);
 }
 
+/* ---------------- 出口探测 ---------------- */
+
+var TRACE_URL = CFG.chatgpt
+  ? "https://chatgpt.com/cdn-cgi/trace"
+  : "https://www.cloudflare.com/cdn-cgi/trace";
+
+function parseTrace(body) {
+  var ip = body.match(/(?:^|\n)ip=([^\s]+)/);
+  var loc = body.match(/(?:^|\n)loc=([A-Z]{2})/);
+  return { ip: ip ? ip[1] : "", loc: loc ? loc[1] : "" };
+}
+
+/** 只探出口，用于路由自检。拿不到就返回 null */
+async function probeExit(nodeRef) {
+  var r = await get(TRACE_URL, nodeRef, { "User-Agent": UA_WEB });
+  if (r.error || !r.body) return null;
+  var t = parseTrace(r.body);
+  if (!t.ip && !t.loc) return null;
+  t.elapsed = r.elapsed;
+  return t;
+}
+
+/**
+ * 路由自检：Loon 的 node 参数如果没生效，所有请求都会从同一个默认出口发出，
+ * 于是每个节点的检测结果完全一致——表现就是"所有节点都可用"。
+ * 这里抽样几个相隔较远的节点比对出口 IP，一样就说明路由没生效。
+ * @return {ok:boolean, reason:string, ip:string, samples:Array}
+ */
+async function routingPreflight(refs) {
+  if (!CFG.routeCheck) return { ok: true, reason: "已关闭路由自检" };
+  if (refs.length < 2) return { ok: true, reason: "节点不足 2 个，无法自检" };
+
+  // 取首、中、尾三个，避开相邻节点常见的同机不同端口
+  var picks = [refs[0], refs[Math.floor(refs.length / 2)], refs[refs.length - 1]];
+  var seen = [];
+  for (var i = 0; i < picks.length; i++) {
+    var e = await probeExit(picks[i]);
+    if (e) seen.push(e);
+  }
+  if (seen.length < 2) {
+    return { ok: true, reason: "有效样本不足 2 个，跳过自检", samples: seen };
+  }
+
+  var ips = seen
+    .map(function (x) {
+      return x.ip;
+    })
+    .filter(Boolean);
+  var uniq = {};
+  ips.forEach(function (i) {
+    uniq[i] = 1;
+  });
+  var distinct = Object.keys(uniq);
+
+  if (ips.length < 2) {
+    return { ok: true, samples: seen, reason: "样本未返回出口 IP，跳过比对" };
+  }
+  if (distinct.length === 1) {
+    return { ok: false, ip: distinct[0], samples: seen, reason: "抽样节点的出口 IP 完全相同" };
+  }
+  return { ok: true, samples: seen, reason: ips.length + " 个样本 / " + distinct.length + " 个不同出口" };
+}
+
 /**
  * 检测单个节点。
  * @param nodeRef 节点名 / 策略组名 / 完整的 Loon 节点描述
  */
 async function detect(nodeRef, label) {
-  var result = { name: label || nodeRef, cc: "", dead: false, latency: 0, ts: Date.now() };
+  var result = {
+    name: label || nodeRef,
+    cc: "",
+    ip: "",
+    dead: false,
+    latency: 0,
+    ts: Date.now()
+  };
 
-  // 先用 Cloudflare trace 做连通性探测并拿到出口地区，代价极小。
+  // 先用 Cloudflare trace 做连通性探测并拿到出口 IP / 地区，代价极小。
   // 开启 ChatGPT 检测时直接打 chatgpt.com，顺带验证 OpenAI 域名可达。
-  var traceUrl = CFG.chatgpt
-    ? "https://chatgpt.com/cdn-cgi/trace"
-    : "https://www.cloudflare.com/cdn-cgi/trace";
-  var trace = await get(traceUrl, nodeRef, { "User-Agent": UA_WEB });
+  var trace = await get(TRACE_URL, nodeRef, { "User-Agent": UA_WEB });
   if (trace.error || !trace.body) {
     result.dead = true;
     result.note = trace.error || "无响应";
     return result;
   }
   result.latency = trace.elapsed;
-  var m = trace.body.match(/loc=([A-Z]{2})/);
-  result.cc = m ? m[1] : "";
+  var t = parseTrace(trace.body);
+  result.ip = t.ip;
+  result.cc = t.loc;
+
+  // 拿不到出口地区就没有可信的判定基础：宁可判为"结论不确定"，
+  // 也不要让地区黑名单静默失效、把所有节点都放行。
+  if (!result.cc) {
+    result.dead = true;
+    result.note = "出口地区未知";
+    return result;
+  }
 
   for (var i = 0; i < ACTIVE.length; i++) {
     var s = ACTIVE[i];
@@ -403,7 +502,12 @@ function saveStore(store) {
 }
 
 function toRecord(result) {
-  var rec = { cc: result.cc || "", ts: result.ts || Date.now(), latency: result.latency || 0 };
+  var rec = {
+    cc: result.cc || "",
+    ip: result.ip || "",
+    ts: result.ts || Date.now(),
+    latency: result.latency || 0
+  };
   for (var i = 0; i < SERVICES.length; i++) {
     var s = SERVICES[i];
     if (result[s.key]) {
@@ -416,7 +520,14 @@ function toRecord(result) {
 }
 
 function fromRecord(rec, name) {
-  var r = { name: name, cc: rec.cc || "", ts: rec.ts || 0, latency: rec.latency || 0, cached: true };
+  var r = {
+    name: name,
+    cc: rec.cc || "",
+    ip: rec.ip || "",
+    ts: rec.ts || 0,
+    latency: rec.latency || 0,
+    cached: true
+  };
   if (rec.dead) r.dead = true;
   for (var i = 0; i < SERVICES.length; i++) {
     var s = SERVICES[i];
@@ -463,7 +574,7 @@ function summarize(results) {
     if (!r) return;
     if (r.dead) {
       dead++;
-      lines.push("  ✖ " + r.name + "  (不可达)");
+      lines.push("  ✖ " + r.name + "  (" + (r.note || "不可达") + ")");
       return;
     }
     var parts = ACTIVE.map(function (s) {
@@ -482,6 +593,7 @@ function summarize(results) {
         "  " +
         flag(r.cc) +
         (r.cc || "??") +
+        (r.ip ? " " + r.ip : "") +
         "  " +
         parts.join("  ")
     );
@@ -495,8 +607,47 @@ function summarize(results) {
     text: lines.join("\n"),
     counter: counter,
     dead: dead,
+    exits: exitReport(results),
     headline: head + "，不可达 " + dead + "，共 " + results.length
   };
+}
+
+/**
+ * 统计出口 IP 分布。实测节点数 ≥2 却只有一个出口，
+ * 基本可以断定 node 路由没生效，结果不可信。
+ */
+function exitReport(results) {
+  var uniq = {};
+  var n = 0;
+  results.forEach(function (r) {
+    if (!r || r.cached || !r.ip) return;
+    n++;
+    uniq[r.ip] = (uniq[r.ip] || 0) + 1;
+  });
+  var distinct = Object.keys(uniq);
+  return {
+    tested: n,
+    distinct: distinct.length,
+    suspicious: n >= 2 && distinct.length === 1,
+    ip: distinct.length === 1 ? distinct[0] : ""
+  };
+}
+
+/** 路由不可信时的统一告警文案 */
+function routingWarning(detail) {
+  return [
+    "",
+    "  ⚠️  路由自检未通过：" + detail,
+    "  这说明 $httpClient 的 node 参数没有把请求分别送出各个节点，",
+    "  所有请求其实都走了同一个出口 —— 此时每个节点拿到的结果完全一样，",
+    "  \"所有节点都可用\" 就是这么来的，结果不可信。",
+    "  处理办法：",
+    "    1) 安装「AI 解锁检测 · 定时任务」插件，它按节点名检测，不依赖节点描述；",
+    "    2) 把解析器插件的 source 参数改成 cache，让解析器只负责改名；",
+    "    3) 确认 Loon 版本 ≥ 3.5.0(969)。",
+    "  本次不会改动任何节点名。",
+    ""
+  ].join("\n");
 }
 
 function notify(title, subtitle, body) {
@@ -827,6 +978,15 @@ async function runBatch() {
   );
 
   var store = loadStore();
+
+  var pre = await routingPreflight(nodes);
+  if (!pre.ok) {
+    log(routingWarning(pre.reason + "，出口 " + pre.ip));
+    notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，本次未检测");
+    return;
+  }
+  log("路由自检通过：" + pre.reason);
+
   var results = await pool(nodes, CFG.concurrency, function (name) {
     return detect(name, name);
   });
@@ -843,14 +1003,26 @@ async function runBatch() {
       }
       continue;
     }
-    store.nodes[baseName(nodes[i])] = toRecord(r);
     final.push(r);
   }
-  saveStore(store);
 
   var sum = summarize(final);
   log("检测结果：\n" + sum.text);
   log("汇总：" + sum.headline);
+  log("出口分布：实测 " + sum.exits.tested + " 个节点，" + sum.exits.distinct + " 个不同出口 IP");
+
+  // 全量跑完后再复核一次：抽样可能蒙混过关，全量不会。
+  // 结果不可信时绝不写缓存，否则会污染解析器后续的改名。
+  if (sum.exits.suspicious) {
+    log(routingWarning("全部 " + sum.exits.tested + " 个节点出口 IP 均为 " + sum.exits.ip));
+    notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，结果未写入缓存");
+    return sum;
+  }
+
+  for (var w = 0; w < nodes.length; w++) {
+    if (results[w]) store.nodes[baseName(nodes[w])] = toRecord(results[w]);
+  }
+  saveStore(store);
 
   await autoSwitch(final);
 
@@ -981,6 +1153,41 @@ async function runParser() {
     doTest = false;
   }
 
+  // ---- 路由自检 ----
+  // 解析阶段是拿"节点描述"当出口的，这条路径不保证在所有 Loon 版本上生效。
+  // 先抽样确认请求真的分别从各节点发出，否则宁可什么都不改。
+  var useName = false;
+  if (doTest) {
+    var testable = entries.filter(function (e) {
+      return e.testable;
+    });
+    var pre = await routingPreflight(
+      testable.map(function (e) {
+        return e.desc;
+      })
+    );
+    if (!pre.ok) {
+      log("按节点描述路由失败（" + pre.reason + "，出口 " + pre.ip + "），改用节点名重试");
+      // 订阅不是第一次导入时，节点名已经在配置里，可以直接当出口用
+      var pre2 = await routingPreflight(
+        testable.map(function (e) {
+          return e.name;
+        })
+      );
+      if (pre2.ok && pre2.samples && pre2.samples.length >= 2) {
+        useName = true;
+        log("按节点名路由可用（" + pre2.reason + "），改用节点名检测");
+      } else {
+        log(routingWarning(pre.reason + "，出口 " + pre.ip));
+        notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，本次未改动任何节点名");
+        $done(content);
+        return;
+      }
+    } else {
+      log("路由自检通过：" + pre.reason);
+    }
+  }
+
   var results = new Array(entries.length);
   var tested = 0;
   var reused = 0;
@@ -1001,13 +1208,30 @@ async function runParser() {
     log("缓存命中 " + reused + "，待实测 " + pending.length + "，预算 " + CFG.budget / 1000 + "s");
 
     var got = await pool(pending, CFG.concurrency, function (idx) {
-      return detect(entries[idx].desc, baseName(entries[idx].name));
+      var ref = useName ? entries[idx].name : entries[idx].desc;
+      return detect(ref, baseName(entries[idx].name));
     });
     for (var j = 0; j < pending.length; j++) {
-      var r = got[j];
-      if (!r) continue;
-      results[pending[j]] = r;
-      store.nodes[baseName(entries[pending[j]].name)] = toRecord(r);
+      if (got[j]) results[pending[j]] = got[j];
+    }
+
+    // 逐节点结果 + 出口分布，全量跑完后再复核一次路由
+    var sum = summarize(results.filter(Boolean));
+    log("逐节点结果：\n" + sum.text);
+    log(
+      "出口分布：实测 " + sum.exits.tested + " 个节点，" + sum.exits.distinct + " 个不同出口 IP"
+    );
+    // 结果不可信时既不写缓存也不改名，原样返回订阅
+    if (sum.exits.suspicious) {
+      log(routingWarning("全部 " + sum.exits.tested + " 个节点出口 IP 均为 " + sum.exits.ip));
+      notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，本次未改动任何节点名");
+      $done(content);
+      return;
+    }
+
+    for (var j2 = 0; j2 < pending.length; j2++) {
+      if (!got[j2]) continue;
+      store.nodes[baseName(entries[pending[j2]].name)] = toRecord(got[j2]);
       tested++;
     }
     saveStore(store);
