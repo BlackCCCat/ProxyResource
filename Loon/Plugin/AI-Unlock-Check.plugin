@@ -1,5 +1,5 @@
 #!name=AI 解锁检测 · 定时任务
-#!desc=定时遍历指定策略组内的节点，检测 ChatGPT / Claude / Gemini 解锁情况，结果写入缓存供解析器打标；可选自动把 AI 策略组切换到延迟最低的可用节点。也可在「节点 / 策略组」页面手动触发查看单节点检测面板。
+#!desc=定时遍历已启用解析器的节点订阅，检测 ChatGPT / Claude / Gemini 解锁情况，结果写入缓存供解析器打标；支持多份订阅，可选自动切换 AI 策略组。也可长按单个节点手动检测。
 #!author=BlackCCCat[https://github.com/BlackCCCat]
 #!homepage=https://github.com/BlackCCCat/ProxyResource
 #!icon=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/OpenAI.png
@@ -10,7 +10,6 @@
 
 [Argument]
 cron = input,"11 */6 * * *",tag=定时表达式,desc=分 时 日 月 周。默认每 6 小时的第 11 分钟跑一次
-group = input,"节点选择",tag=待检测的策略组,desc=必填。脚本会遍历这个策略组里的所有节点（建议填一个包含全部节点的组）
 chatgpt = switch,true,tag=检测 ChatGPT
 claude = switch,true,tag=检测 Claude
 gemini = switch,true,tag=检测 Gemini,desc=单节点约 800KB 流量，蜂窝网络下建议改用 lite
@@ -29,6 +28,6 @@ cacheTTL = input,"12",tag=缓存有效期,desc=小时
 notify = switch,true,tag=完成后通知
 
 [Script]
-cron {cron} script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,enable=true,argument=[{group},{chatgpt},{claude},{gemini},{depth},{strict},{routeCheck},{extraBlockCC},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]
+cron {cron} script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,enable=true,argument=[{chatgpt},{claude},{gemini},{depth},{strict},{routeCheck},{extraBlockCC},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]
 
-generic script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,img-url=sparkles.system,argument=[{group},{chatgpt},{claude},{gemini},{depth},{strict},{routeCheck},{extraBlockCC},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]
+generic script-path=https://raw.githubusercontent.com/BlackCCCat/ProxyResource/main/Loon/Script/ai_unlock.js,tag=AI解锁检测,timeout=300,img-url=sparkles.system,argument=[{chatgpt},{claude},{gemini},{depth},{strict},{routeCheck},{extraBlockCC},{gptGroup},{cldGroup},{gmnGroup},{marker},{concurrency},{timeout},{budget},{cacheTTL},{notify}]

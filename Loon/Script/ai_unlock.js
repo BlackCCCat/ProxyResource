@@ -7,7 +7,7 @@
  * 同一个文件同时支持三种运行方式，靠环境变量自动判别：
  *   1) parser  —— 作为「资源解析器」挂在节点订阅上（$resourceType 存在）
  *                 订阅更新时给节点改名打标记，标记源可以是实时检测或缓存。
- *   2) cron    —— 定时任务，遍历指定策略组内的节点逐个检测，结果写入缓存，
+ *   2) cron    —— 定时任务，遍历解析器登记的订阅节点逐个检测，结果写入缓存，
  *                 可选自动把 AI 策略组切到最优节点。
  *   3) generic —— 在 App 内手动触发。作用于单个节点时只测该节点并弹出面板；
  *                 作用于策略组时等同 cron。
@@ -88,7 +88,6 @@ var CFG = {
   sortFirst: bool(ARG.sortFirst, true),
 
   // 批量检测行为
-  group: str(ARG.group, ""),
   gptGroup: str(ARG.gptGroup, ""),
   cldGroup: str(ARG.cldGroup, ""),
   gmnGroup: str(ARG.gmnGroup, ""),
@@ -482,14 +481,19 @@ async function pool(items, limit, worker) {
  * ================================================================== */
 
 var STORE_KEY = "AI_UNLOCK_RESULTS";
+var SOURCE_TTL = 30 * 24 * 3600 * 1000;
 
 function loadStore() {
   try {
     var raw = $persistentStore.read(STORE_KEY);
     var o = raw ? JSON.parse(raw) : null;
-    if (o && typeof o === "object" && o.nodes) return o;
+    if (o && typeof o === "object") {
+      if (!o.nodes || typeof o.nodes !== "object") o.nodes = {};
+      if (!o.sources || typeof o.sources !== "object") o.sources = {};
+      return o;
+    }
   } catch (e) {}
-  return { updated: 0, nodes: {} };
+  return { updated: 0, nodes: {}, sources: {} };
 }
 
 function saveStore(store) {
@@ -553,6 +557,58 @@ function cacheHit(store, base) {
   if (!rec) return null;
   if (!rec.ts || Date.now() - rec.ts > CFG.cacheTTL) return null;
   return fromRecord(rec, base);
+}
+
+function sourceKey(url) {
+  var value = String(url || "local-resource");
+  var hash = 2166136261;
+  for (var i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return "source-" + (hash >>> 0).toString(16);
+}
+
+function sourceLabel(url) {
+  var value = String(url || "local-resource");
+  var match = value.match(/^https?:\/\/([^/?#]+)/i);
+  return match ? match[1] : value.split(/[/?#]/)[0];
+}
+
+function registerSource(store, entries) {
+  var url = typeof $resourceUrl !== "undefined" ? String($resourceUrl || "") : "";
+  var unique = {};
+  entries.forEach(function (entry) {
+    var name = baseName(entry.name);
+    if (name) unique[name] = 1;
+  });
+  var key = sourceKey(url);
+  store.sources[key] = {
+    label: sourceLabel(url) + " [" + key.slice(-6) + "]",
+    nodes: Object.keys(unique),
+    updated: Date.now()
+  };
+  return store.sources[key];
+}
+
+function registeredNodes(store) {
+  var unique = {};
+  var active = [];
+  var stale = 0;
+  Object.keys(store.sources || {}).forEach(function (key) {
+    var source = store.sources[key];
+    if (!source || !Array.isArray(source.nodes) || !source.updated || Date.now() - source.updated > SOURCE_TTL) {
+      delete store.sources[key];
+      stale++;
+      return;
+    }
+    active.push(source);
+    source.nodes.forEach(function (name) {
+      var base = baseName(name);
+      if (base) unique[base] = 1;
+    });
+  });
+  return { nodes: Object.keys(unique), sources: active, stale: stale };
 }
 
 /* ==================================================================
@@ -653,8 +709,8 @@ function routingWarning(detail) {
     "  \"所有节点都可用\" 或 \"所有节点都不支持\" 就是这么来的，实测结果不可信。",
     "  解析阶段拿不到可信结果时，本脚本会退回使用「定时任务」插件写入的缓存来改名。",
     "  所以请确认：",
-    "    1) 已安装并跑过「AI 解锁检测 · 定时任务」插件（它按节点名检测，不依赖节点描述）；",
-    "    2) 该插件的 group 参数填的是包含全部节点的策略组；",
+    "    1) 每份待检测的节点订阅都启用了本解析器，并至少更新过一次；",
+    "    2) 已安装并跑过「AI 解锁检测 · 定时任务」插件；",
     "    3) 解析器插件的 source 参数设为 cache，省掉这次无谓的实测。",
     ""
   ].join("\n");
@@ -892,101 +948,6 @@ function parseClashYaml(text) {
   };
 }
 
-/* ==================================================================
- * 9. Loon 配置 API 封装
- * ================================================================== */
-
-function getConfigObject() {
-  try {
-    var raw = $config.getConfig();
-    return typeof raw === "string" ? JSON.parse(raw) : raw || {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function getSubPolicies(group) {
-  return new Promise(function (resolve) {
-    var settled = false;
-    function done(v) {
-      if (settled) return;
-      settled = true;
-      resolve(v);
-    }
-    setTimeout(function () {
-      done([]);
-    }, 5000);
-    try {
-      $config.getSubPolicies(group, function (subs) {
-        if (typeof subs === "string") {
-          try {
-            subs = JSON.parse(subs);
-          } catch (e) {
-            subs = [];
-          }
-        }
-        done(Array.isArray(subs) ? subs : []);
-      });
-    } catch (e) {
-      done([]);
-    }
-  });
-}
-
-/**
- * 把策略组递归展开成真实节点名。
- *
- * 直接取 getSubPolicies(组) 只能拿到"直接成员"——如果用户的组里装的是
- * 香港/美国/日本这类筛选节点组，拿到的就是一堆组名而不是节点名，
- * 测出来的结果也存不进能和订阅节点名对上的缓存。
- *
- * 判断依据：对叶子节点调用 getSubPolicies 返回空数组，对组则返回成员。
- * 每一层并发探测，所以整层只花一个超时的时间，不是 N 个。
- */
-async function expandGroup(root, builtin, maxDepth) {
-  var seen = {};
-  var leaves = [];
-  var viaGroups = [];
-  seen[root] = 1;
-
-  function skippable(n) {
-    return !n || seen[n] || builtin.indexOf(n) !== -1 || n === "DIRECT" || /^REJECT/i.test(n);
-  }
-
-  var frontier = await getSubPolicies(root);
-  var depth = 0;
-
-  while (frontier.length && depth < maxDepth) {
-    var candidates = [];
-    for (var i = 0; i < frontier.length; i++) {
-      if (skippable(frontier[i])) continue;
-      seen[frontier[i]] = 1;
-      candidates.push(frontier[i]);
-    }
-    if (!candidates.length) break;
-
-    var subs = await Promise.all(
-      candidates.map(function (n) {
-        return getSubPolicies(n);
-      })
-    );
-
-    var next = [];
-    for (var j = 0; j < candidates.length; j++) {
-      if (subs[j] && subs[j].length) {
-        viaGroups.push(candidates[j]);
-        next = next.concat(subs[j]);
-      } else {
-        leaves.push(candidates[j]);
-      }
-    }
-    frontier = next;
-    depth++;
-  }
-
-  return { nodes: leaves, groups: viaGroups, depth: depth };
-}
-
 function setSelectPolicy(group, policy) {
   try {
     if ($config.setSelectPolicy) return $config.setSelectPolicy(group, policy);
@@ -999,49 +960,37 @@ function setSelectPolicy(group, policy) {
 }
 
 /* ==================================================================
- * 10. 批量检测（cron / generic 作用于策略组）
+ * 10. 批量检测（cron / generic）
  * ================================================================== */
 
 async function runBatch() {
-  var conf = getConfigObject();
-  var groups = conf.all_policy_groups || [];
-
-  var target = CFG.group;
-  if (!target) {
-    log("未配置待检测的策略组，请在插件参数 group 中填写。当前配置中的策略组：");
-    log("  " + groups.join(" | "));
-    notify("AI 解锁检测", "未配置策略组", "请在插件参数中填写 group（要检测的策略组名）");
-    return;
-  }
-  if (groups.indexOf(target) === -1) {
-    log("策略组「" + target + "」不存在。可用：" + groups.join(" | "));
-    notify("AI 解锁检测", "策略组不存在", target);
-    return;
-  }
-
-  var builtin = conf.all_buildin_nodes || ["DIRECT", "REJECT"];
-  var expanded = await expandGroup(target, builtin, 4);
-  var nodes = expanded.nodes;
+  var store = loadStore();
+  var registry = registeredNodes(store);
+  var nodes = registry.nodes;
+  if (registry.stale) saveStore(store);
 
   if (!nodes.length) {
-    log("策略组「" + target + "」内没有可检测的节点");
-    notify("AI 解锁检测", "没有可检测的节点", target);
+    log("没有已登记的订阅节点。请先给节点订阅启用本解析器，并更新一次订阅。");
+    notify("AI 解锁检测", "没有已登记的订阅", "请先更新启用了 AI 解锁解析器的节点订阅");
     return;
   }
-  log(
-    "展开策略组「" + target + "」：递归 " + expanded.depth + " 层，得到 " + nodes.length +
-      " 个真实节点" + (expanded.groups.length ? "（途经子组：" + expanded.groups.join("、") + "）" : "")
-  );
+  log("读取 " + registry.sources.length + " 份订阅，共 " + nodes.length + " 个节点" +
+    (registry.stale ? "（忽略 " + registry.stale + " 份超过 30 天未更新的订阅）" : ""));
+  registry.sources.forEach(function (source) {
+    log("  · " + source.label + "：" + source.nodes.length + " 个节点");
+  });
+
+  var routeNames = nodes.map(function (name) {
+    return storedName(store, name);
+  });
 
   log(
-    "开始检测：组=" + target + "，节点=" + nodes.length + "，并发=" + CFG.concurrency +
+    "开始检测：订阅=" + registry.sources.length + "，节点=" + nodes.length + "，并发=" + CFG.concurrency +
       "，模式=" + CFG.depth + (CFG.strict ? "(严格)" : "") +
       "，服务=" + ACTIVE.map(function (s) { return s.name; }).join("/")
   );
 
-  var store = loadStore();
-
-  var pre = await routingPreflight(nodes);
+  var pre = await routingPreflight(routeNames);
   if (!pre.ok) {
     log(routingWarning(pre.reason + "，出口 " + pre.ip));
     notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，本次未检测");
@@ -1049,7 +998,7 @@ async function runBatch() {
   }
   log("路由自检通过：" + pre.reason);
 
-  var results = await pool(nodes, CFG.concurrency, function (name) {
+  var results = await pool(routeNames, CFG.concurrency, function (name) {
     return detect(name, name);
   });
 
@@ -1060,7 +1009,7 @@ async function runBatch() {
       // 超出预算未测到，退回缓存
       var c = cacheHit(store, baseName(nodes[i]));
       if (c) {
-        c.name = nodes[i];
+        c.name = routeNames[i];
         final.push(c);
       }
       continue;
@@ -1082,7 +1031,11 @@ async function runBatch() {
   }
 
   for (var w = 0; w < nodes.length; w++) {
-    if (results[w]) store.nodes[baseName(nodes[w])] = toRecord(results[w]);
+    if (results[w]) {
+      var rec = toRecord(results[w]);
+      rec.lastName = routeNames[w];
+      store.nodes[baseName(nodes[w])] = rec;
+    }
   }
   saveStore(store);
 
@@ -1090,7 +1043,7 @@ async function runBatch() {
 
   notify(
     "AI 解锁检测完成",
-    target + " · " + CFG.depth + (CFG.strict ? " · 严格" : ""),
+    registry.sources.length + " 份订阅 · " + CFG.depth + (CFG.strict ? " · 严格" : ""),
     sum.headline
   );
   return sum;
@@ -1202,6 +1155,9 @@ async function runParser() {
 
   var store = loadStore();
   var entries = parsed.entries;
+  var registered = registerSource(store, entries);
+  saveStore(store);
+  log("已登记订阅 " + registered.label + "：" + registered.nodes.length + " 个节点");
 
   // 决定是否在解析阶段实测
   var canTest = entries.some(function (e) {
@@ -1335,8 +1291,8 @@ async function runParser() {
       log("    缓存键名样本：   " + storedKeys.slice(0, 3).map(function (k) {
         return JSON.stringify(k);
       }).join("  "));
-      log("  两边对不上通常是因为定时任务插件的 group 填的不是这个订阅所在的策略组，");
-      log("  或者缓存已经过期（cacheTTL 默认 12 小时）。");
+      log("  两边对不上通常是因为订阅节点名称已经变化，或缓存已经过期（cacheTTL 默认 12 小时）。");
+      log("  请依次执行：更新订阅 → 运行定时任务 → 再次更新订阅。");
     }
     log("");
     notify("AI 解锁检测 · 无可用结果", "没有节点被打标记", storedKeys.length

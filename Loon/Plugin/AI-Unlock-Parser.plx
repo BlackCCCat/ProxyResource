@@ -1,5 +1,5 @@
 #!name=AI 解锁检测 · 订阅解析器
-#!desc=订阅更新时逐个检测节点能否解锁 ChatGPT / Claude / Gemini，给通过的节点名追加标记（如 ⚡GPT+CLD+GMN），配合「筛选节点 → NameRegex」把它们自动汇聚到策略组。挂在「节点订阅」的解析器位置使用。
+#!desc=挂在节点订阅上使用：更新时登记订阅中的真实节点，并按检测缓存追加 AI 解锁标记（如 ⚡GPT+CLD+GMN）。多份订阅可同时启用，定时任务会自动汇总检测。
 #!author=BlackCCCat[https://github.com/BlackCCCat]
 #!homepage=https://github.com/BlackCCCat/ProxyResource
 #!icon=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/OpenAI.png
