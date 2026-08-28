@@ -538,6 +538,16 @@ function fromRecord(rec, name) {
   return r;
 }
 
+/**
+ * 订阅里的节点名是"原始名"，但配置里那个节点可能已经被上一轮打过标记。
+ * 拿它当 node 参数路由时要用配置里的实际名字。
+ */
+function storedName(store, subName) {
+  var base = baseName(subName);
+  var rec = store.nodes[base];
+  return rec && rec.lastName ? rec.lastName : base;
+}
+
 function cacheHit(store, base) {
   var rec = store.nodes[base];
   if (!rec) return null;
@@ -640,12 +650,12 @@ function routingWarning(detail) {
     "  ⚠️  路由自检未通过：" + detail,
     "  这说明 $httpClient 的 node 参数没有把请求分别送出各个节点，",
     "  所有请求其实都走了同一个出口 —— 此时每个节点拿到的结果完全一样，",
-    "  \"所有节点都可用\" 就是这么来的，结果不可信。",
-    "  处理办法：",
-    "    1) 安装「AI 解锁检测 · 定时任务」插件，它按节点名检测，不依赖节点描述；",
-    "    2) 把解析器插件的 source 参数改成 cache，让解析器只负责改名；",
-    "    3) 确认 Loon 版本 ≥ 3.5.0(969)。",
-    "  本次不会改动任何节点名。",
+    "  \"所有节点都可用\" 或 \"所有节点都不支持\" 就是这么来的，实测结果不可信。",
+    "  解析阶段拿不到可信结果时，本脚本会退回使用「定时任务」插件写入的缓存来改名。",
+    "  所以请确认：",
+    "    1) 已安装并跑过「AI 解锁检测 · 定时任务」插件（它按节点名检测，不依赖节点描述）；",
+    "    2) 该插件的 group 参数填的是包含全部节点的策略组；",
+    "    3) 解析器插件的 source 参数设为 cache，省掉这次无谓的实测。",
     ""
   ].join("\n");
 }
@@ -923,6 +933,60 @@ function getSubPolicies(group) {
   });
 }
 
+/**
+ * 把策略组递归展开成真实节点名。
+ *
+ * 直接取 getSubPolicies(组) 只能拿到"直接成员"——如果用户的组里装的是
+ * 香港/美国/日本这类筛选节点组，拿到的就是一堆组名而不是节点名，
+ * 测出来的结果也存不进能和订阅节点名对上的缓存。
+ *
+ * 判断依据：对叶子节点调用 getSubPolicies 返回空数组，对组则返回成员。
+ * 每一层并发探测，所以整层只花一个超时的时间，不是 N 个。
+ */
+async function expandGroup(root, builtin, maxDepth) {
+  var seen = {};
+  var leaves = [];
+  var viaGroups = [];
+  seen[root] = 1;
+
+  function skippable(n) {
+    return !n || seen[n] || builtin.indexOf(n) !== -1 || n === "DIRECT" || /^REJECT/i.test(n);
+  }
+
+  var frontier = await getSubPolicies(root);
+  var depth = 0;
+
+  while (frontier.length && depth < maxDepth) {
+    var candidates = [];
+    for (var i = 0; i < frontier.length; i++) {
+      if (skippable(frontier[i])) continue;
+      seen[frontier[i]] = 1;
+      candidates.push(frontier[i]);
+    }
+    if (!candidates.length) break;
+
+    var subs = await Promise.all(
+      candidates.map(function (n) {
+        return getSubPolicies(n);
+      })
+    );
+
+    var next = [];
+    for (var j = 0; j < candidates.length; j++) {
+      if (subs[j] && subs[j].length) {
+        viaGroups.push(candidates[j]);
+        next = next.concat(subs[j]);
+      } else {
+        leaves.push(candidates[j]);
+      }
+    }
+    frontier = next;
+    depth++;
+  }
+
+  return { nodes: leaves, groups: viaGroups, depth: depth };
+}
+
 function setSelectPolicy(group, policy) {
   try {
     if ($config.setSelectPolicy) return $config.setSelectPolicy(group, policy);
@@ -955,21 +1019,19 @@ async function runBatch() {
     return;
   }
 
-  var subs = await getSubPolicies(target);
   var builtin = conf.all_buildin_nodes || ["DIRECT", "REJECT"];
-  var nodes = subs.filter(function (n) {
-    if (!n) return false;
-    if (builtin.indexOf(n) !== -1) return false;
-    if (/^REJECT/i.test(n) || n === "DIRECT") return false;
-    if (groups.indexOf(n) !== -1) return false; // 跳过嵌套策略组
-    return true;
-  });
+  var expanded = await expandGroup(target, builtin, 4);
+  var nodes = expanded.nodes;
 
   if (!nodes.length) {
     log("策略组「" + target + "」内没有可检测的节点");
     notify("AI 解锁检测", "没有可检测的节点", target);
     return;
   }
+  log(
+    "展开策略组「" + target + "」：递归 " + expanded.depth + " 层，得到 " + nodes.length +
+      " 个真实节点" + (expanded.groups.length ? "（途经子组：" + expanded.groups.join("、") + "）" : "")
+  );
 
   log(
     "开始检测：组=" + target + "，节点=" + nodes.length + "，并发=" + CFG.concurrency +
@@ -1168,20 +1230,22 @@ async function runParser() {
     );
     if (!pre.ok) {
       log("按节点描述路由失败（" + pre.reason + "，出口 " + pre.ip + "），改用节点名重试");
-      // 订阅不是第一次导入时，节点名已经在配置里，可以直接当出口用
+      // 订阅不是第一次导入时，节点已经在配置里了，可以直接用节点名当出口。
+      // 上一轮打过标记的话，配置里的名字是带标记的，所以两种都要试。
       var pre2 = await routingPreflight(
         testable.map(function (e) {
-          return e.name;
+          return storedName(store, e.name);
         })
       );
       if (pre2.ok && pre2.samples && pre2.samples.length >= 2) {
         useName = true;
         log("按节点名路由可用（" + pre2.reason + "），改用节点名检测");
       } else {
+        // 两条路都不通。不要放弃——定时任务插件写的缓存是按节点名测出来的，
+        // 那份结果是可信的，退回去用它改名，比什么都不做有用得多。
+        log("按节点名路由同样不可用（" + pre2.reason + "），本次不实测，改用缓存结果");
         log(routingWarning(pre.reason + "，出口 " + pre.ip));
-        notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，本次未改动任何节点名");
-        $done(content);
-        return;
+        doTest = false;
       }
     } else {
       log("路由自检通过：" + pre.reason);
@@ -1221,20 +1285,27 @@ async function runParser() {
     log(
       "出口分布：实测 " + sum.exits.tested + " 个节点，" + sum.exits.distinct + " 个不同出口 IP"
     );
-    // 结果不可信时既不写缓存也不改名，原样返回订阅
+    // 全量结果不可信：丢掉这批实测，退回缓存，而不是整个放弃
     if (sum.exits.suspicious) {
       log(routingWarning("全部 " + sum.exits.tested + " 个节点出口 IP 均为 " + sum.exits.ip));
-      notify("AI 解锁检测 · 结果不可信", "路由自检未通过", "所有节点出口 IP 相同，本次未改动任何节点名");
-      $done(content);
-      return;
+      for (var z = 0; z < pending.length; z++) results[pending[z]] = null;
+      for (var z2 = 0; z2 < entries.length; z2++) {
+        if (results[z2]) continue;
+        var zc = cacheHit(store, baseName(entries[z2].name));
+        if (zc) {
+          results[z2] = zc;
+          reused++;
+        }
+      }
+      log("已丢弃本次实测结果，改用缓存：命中 " + reused + " / " + entries.length);
+    } else {
+      for (var j2 = 0; j2 < pending.length; j2++) {
+        if (!got[j2]) continue;
+        store.nodes[baseName(entries[pending[j2]].name)] = toRecord(got[j2]);
+        tested++;
+      }
+      saveStore(store);
     }
-
-    for (var j2 = 0; j2 < pending.length; j2++) {
-      if (!got[j2]) continue;
-      store.nodes[baseName(entries[pending[j2]].name)] = toRecord(got[j2]);
-      tested++;
-    }
-    saveStore(store);
   } else {
     for (var k = 0; k < entries.length; k++) {
       var cc = cacheHit(store, baseName(entries[k].name));
@@ -1244,6 +1315,35 @@ async function runParser() {
       }
     }
     log("使用缓存结果：命中 " + reused + " / " + entries.length);
+  }
+
+  // ---- 缓存覆盖率诊断 ----
+  // "一个标记都没打上" 绝大多数是订阅里的节点名和缓存里的键对不上，
+  // 把两边的样本都打出来，一眼就能看出是不是名字问题。
+  if (reused === 0 && tested === 0) {
+    var storedKeys = Object.keys(store.nodes || {});
+    log("");
+    log("  ⚠️  本次没有任何可用的检测结果，所有节点都不会被打标记。");
+    if (!storedKeys.length) {
+      log("  缓存是空的 —— 「AI 解锁检测 · 定时任务」插件还没成功跑过。");
+      log("  请先打开该插件手动触发一次，或等它的 cron 到点，再更新订阅。");
+    } else {
+      log("  缓存里有 " + storedKeys.length + " 条记录，但和本订阅的节点名一条都对不上：");
+      log("    订阅节点名样本： " + entries.slice(0, 3).map(function (e) {
+        return JSON.stringify(baseName(e.name));
+      }).join("  "));
+      log("    缓存键名样本：   " + storedKeys.slice(0, 3).map(function (k) {
+        return JSON.stringify(k);
+      }).join("  "));
+      log("  两边对不上通常是因为定时任务插件的 group 填的不是这个订阅所在的策略组，");
+      log("  或者缓存已经过期（cacheTTL 默认 12 小时）。");
+    }
+    log("");
+    notify("AI 解锁检测 · 无可用结果", "没有节点被打标记", storedKeys.length
+      ? "缓存与订阅节点名对不上，详见日志"
+      : "定时任务插件还没跑过，请先手动触发一次");
+  } else if (reused + tested < entries.length) {
+    log("覆盖率：" + (reused + tested) + " / " + entries.length + " 个节点有结果，其余保持原名");
   }
 
   // 应用新名字
@@ -1282,6 +1382,18 @@ async function runParser() {
     });
   }
 
+  // 记下这一轮实际写进订阅的名字。下次解析时配置里的节点就叫这个，
+  // 按节点名路由要用它，不能用订阅里的原始名。
+  var touched = false;
+  for (var q = 0; q < entries.length; q++) {
+    var qb = baseName(entries[q].name);
+    if (store.nodes[qb] && store.nodes[qb].lastName !== entries[q].newName) {
+      store.nodes[qb].lastName = entries[q].newName;
+      touched = true;
+    }
+  }
+  if (touched) saveStore(store);
+
   var output = parsed.render(ordered, dropped);
 
   log(
@@ -1289,11 +1401,14 @@ async function runParser() {
       "，打标 " + hitCount + "，" +
       (CFG.dropFailed ? "已删除 " + Object.keys(dropped).length + " 个未解锁节点" : "保留全部节点")
   );
-  notify(
-    "AI 解锁检测 · 订阅已更新",
-    "打标 " + hitCount + " / " + entries.length,
-    ACTIVE.map(function (s) { return s.name; }).join(" · ") + "｜标记：" + CFG.marker
-  );
+  // 没有任何结果时上面已经发过告警了，别再补一条"已更新"把它盖掉
+  if (reused + tested > 0) {
+    notify(
+      "AI 解锁检测 · 订阅已更新",
+      "打标 " + hitCount + " / " + entries.length,
+      ACTIVE.map(function (s) { return s.name; }).join(" · ") + "｜标记：" + CFG.marker
+    );
+  }
 
   $done(output);
 }

@@ -18,7 +18,7 @@ routeCheck = switch,true,tag=路由自检,desc=抽样比对各节点的出口 IP
 extraBlockCC = input,"",tag=追加地区黑名单,desc=逗号分隔的两位国家码，如 TW,VN。对三家服务同时生效
 marker = input,"⚡",tag=标记前缀,desc=打在节点名末尾，最终形如「节点名 ⚡GPT+CLD+GMN」。改这里要同步改筛选节点的正则
 tagMode = select,"any","all",tag=打标条件,desc=any=命中任一服务即打标；all=需同时解锁所有已开启的服务
-source = select,"auto","test","cache",tag=结果来源,desc=auto=能实测就实测（仅 Loon 原生格式订阅可实测）；test=强制实测；cache=只用定时任务写入的缓存
+source = select,"cache","auto","test",tag=结果来源,desc=cache=只用「定时任务」插件写入的缓存改名（推荐，最可靠）；auto=先尝试在解析阶段实测，路由不可信时自动退回缓存；test=强制实测
 sortFirst = switch,true,tag=已解锁节点排在前面,desc=Clash YAML 格式下不生效
 dropFailed = switch,false,tag=删除未解锁节点,desc=谨慎开启。只删除有明确检测结果且未解锁的节点，未测到的一律保留；Clash YAML 格式下不生效
 concurrency = input,"5",tag=并发数,desc=1-16，节点多可调高，但太高容易互相干扰
